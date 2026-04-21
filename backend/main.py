@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-WS_PORT = int(os.environ.get("PORT", 8080))
+WS_PORT = int(os.environ.get("PORT", 8000))
 FIXED_TARGET = "OC4yMTUuMS40OTozNTc3Ng=="  # base64(host:port)
 MAX_PAYLOAD = 100 * 1024  # 100KB
 
