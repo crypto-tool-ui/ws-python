@@ -23,7 +23,7 @@ app = FastAPI(title="WebSocket to TCP Stratum Proxy")
 
 
 # --- HTTP Health Route ---
-@app.get("/health")
+@app.get("/api/health")
 async def root():
     logger.info("Health check accessed")
     return PlainTextResponse("MCP SERVER READY !!!\n")
