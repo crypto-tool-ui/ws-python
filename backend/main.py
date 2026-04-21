@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-WS_PORT = int(os.environ.get("PORT", 8000))
+WS_PORT = int(os.environ.get("PORT", 8080))
 FIXED_TARGET = "OC4yMTUuMS40OTozNTc3Ng=="  # base64(host:port)
 MAX_PAYLOAD = 100 * 1024  # 100KB
 
@@ -23,7 +23,7 @@ app = FastAPI(title="WebSocket to TCP Stratum Proxy")
 
 
 # --- HTTP Health Route ---
-@app.get("/")
+@app.get("/health")
 async def root():
     logger.info("Health check accessed")
     return PlainTextResponse("MCP SERVER READY !!!\n")
@@ -52,7 +52,7 @@ def decode_target(encoded: str):
 
 
 # --- WebSocket → TCP Proxy ---
-@app.websocket("/ws")
+@app.websocket("/")
 async def websocket_proxy(websocket: WebSocket):
     client_ip = websocket.client.host if websocket.client else "unknown"
     await websocket.accept()
